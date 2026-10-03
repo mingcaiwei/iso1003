@@ -1,0 +1,26 @@
+name: Build EthernetLauncher tipa
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid || true
+
+      - name: Build
+        run: bash build.sh
+
+      - name: Upload tipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: EthernetLauncher-tipa
+          path: EthernetLauncher.tipa
+          if-no-files-found: error

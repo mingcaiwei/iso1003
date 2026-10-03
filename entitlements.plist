@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 平台应用：允许以系统级身份运行 -->
+	<key>platform-application</key>
+	<true/>
+
+	<!-- 免沙盒 / 免容器：可读写全盘、访问系统资源 -->
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+
+	<!-- 读取网络配置（SystemConfiguration / SCPreferences） -->
+	<key>com.apple.private.SystemConfiguration.preferences</key>
+	<true/>
+	<key>com.apple.private.SystemConfiguration.dynamic-store</key>
+	<true/>
+	<key>com.apple.wifi.manager-access</key>
+	<true/>
+	<key>com.apple.private.network.socket-delegate</key>
+	<true/>
+
+	<!-- 拉起其它 App（FrontBoardServices / SpringBoard） -->
+	<key>com.apple.springboard.launchapplications</key>
+	<true/>
+	<key>com.apple.springboard.launchapplicationswithoptions</key>
+	<true/>
+	<key>com.apple.frontboard.launchapplications</key>
+	<true/>
+	<key>com.apple.backboardd.launchapplications</key>
+	<true/>
+	<key>com.apple.private.security.storage.launchd</key>
+	<true/>
+
+	<!-- 以 root / 高权限运行守护进程 -->
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>
