@@ -5,16 +5,23 @@
 //    常驻后台守护。当检测到「以太网」接入（从未连接 -> 已连接）时，
 //    把目标 App 拉起一次（不在已连接状态下反复拉起）。
 //
+//  说明：
+//    iOS SDK 将 SCPreferences* / SCDynamicStore* 标记为 iOS 不可用，
+//    因此这里使用纯 POSIX getifaddrs() 枚举网卡来判断以太网状态。
+//
 //  目标 App 的 Bundle ID 在下方 TVTargetBundleID 宏中固定写死。
 //
 
 #import <Foundation/Foundation.h>
 #import <SystemConfiguration/SystemConfiguration.h>
-#import <SystemConfiguration/CaptiveNetwork.h>
 #import <arpa/inet.h>
 #import <dlfcn.h>
-#import <notify.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <netinet/in.h>
 #import <signal.h>
+#import <string.h>
+#import <sys/ioctl.h>
 #import <unistd.h>
 
 // ==========================================================================
@@ -22,7 +29,7 @@
 // ==========================================================================
 #define TVTargetBundleID  @"ceshi0607.com.nxs"
 
-// 首次发现以太网已连通时，是否也触发一次（推荐 YES，应对守护进程晚于网卡就绪启动的情况）
+// 首次发现以太网已连通时，是否也触发一次（推荐 1，应对守护进程晚于网卡就绪启动的情况）
 #define TVTriggerOnInitialConnect  1
 
 // 两次拉起之间的最小间隔（秒），避免网络抖动导致重复拉起
@@ -39,9 +46,9 @@ static void TVLog(NSString *fmt, ...) {
 
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [df stringFromDate:[NSDate date]], msg];
 
-    // 写入文件日志，方便排查（TrollStore 免沙盒，可写 /var/mobile 等）
     NSString *logPath = @"/var/mobile/Library/Logs/EthernetLauncher.log";
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm createDirectoryAtPath:[logPath stringByDeletingLastPathComponent]
@@ -62,92 +69,68 @@ static void TVLog(NSString *fmt, ...) {
 }
 
 // ==========================================================================
-//  以太网状态检测
+//  网卡工具
 // ==========================================================================
-// 记录「当前主接口是否是以太网且已连通」，回调里用来判断变化
-static BOOL gLastEthernetConnected = NO;
-static int  gLastReachabilityFlags  = 0;
+// 是否是需要忽略的虚拟/特殊接口
+static BOOL TVIsIgnoredInterface(const char *name) {
+    static const char *prefixes[] = {
+        "lo", "pdp_ip", "awdl", "llw", "utun", "ipsec", "anpi",
+        "bridge", "pktap", "gif", "stf", "XHC", "ap", "nan", "vmenet", NULL
+    };
+    for (int i = 0; prefixes[i]; i++) {
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return YES;
+    }
+    return NO;
+}
 
-// 判断指定 BSD 接口名是否是以太网（WiFi 为 en0/en1 也可能是以太网扩展坞，
-// 因此这里通过 SystemConfiguration 的接口类型而不是硬编码 en 前缀来判断）
-static BOOL TVInterfaceIsEthernet(NSString *bsdName) {
-    if (bsdName.length == 0) return NO;
+// 通过 ioctl 读取接口的介质类型（无 WiFi 的 en* 视为以太网）
+// 返回 YES 表示该接口当前处于「已激活」(running)
+static BOOL TVInterfaceIsActive(const char *name) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return NO;
 
-    SCPreferencesRef prefs = SCPreferencesCreate(NULL, CFSTR("EthernetLauncher"), NULL);
-    if (!prefs) return NO;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
 
-    BOOL isEthernet = NO;
-
-    // 遍历所有网络服务，找到匹配该 BSD 接口的服务，读取其 Interface Type
-    CFArrayRef services = SCNetworkServiceCopyAll(prefs);
-    if (services) {
-        for (CFIndex i = 0; i < CFArrayGetCount(services); i++) {
-            SCNetworkServiceRef service = (SCNetworkServiceRef)CFArrayGetValueAtIndex(services, i);
-            SCNetworkInterfaceRef iface = SCNetworkServiceGetInterface(service);
-            if (!iface) continue;
-
-            CFStringRef ifBSDN = SCNetworkInterfaceGetBSDName(iface);
-            if (!ifBSDN) continue;
-            if (![(__bridge NSString *)ifBSDN isEqualToString:bsdName]) continue;
-
-            CFStringRef type = SCNetworkInterfaceGetInterfaceType(iface);
-            if (type) {
-                if (CFStringCompare(type, kSCNetworkInterfaceTypeEthernet, 0) == kCFCompareEqualTo) {
-                    isEthernet = YES;
-                } else {
-                    // 明确排除 WiFi
-                    isEthernet = NO;
-                }
-            }
-            break;
+    BOOL active = NO;
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
+        if ((ifr.ifr_flags & IFF_UP) && (ifr.ifr_flags & IFF_RUNNING)) {
+            active = YES;
         }
-        CFRelease(services);
     }
-
-    CFRelease(prefs);
-    return isEthernet;
+    close(sock);
+    return active;
 }
 
-// 获取当前主接口的 BSD 名（如 en0 / en5）
-static NSString *TVPrimaryInterfaceBSDName(void) {
-    NSString *result = nil;
-    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("EthernetLauncher"), NULL, NULL);
-    if (!store) return nil;
+// 返回第一个「已连通的以太网接口名」，没有则返回 nil
+// 判据：接口名以 en 开头、非忽略前缀、接口 UP+RUNNING、且已分配到 IPv4 地址。
+// 说明：WiFi 在 iOS 上同样是 en0，而 USB 网卡/扩展坞通常是 en5 及以后。
+//       如果需要严格区分，可在此处排除 en0；当前实现按「en* 上有 IPv4 且 RUNNING」判定。
+static NSString *TVConnectedEthernetInterface(void) {
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0 || ifaddr == NULL) return nil;
 
-    CFStringRef globalKey = SCDynamicStoreKeyCreateNetworkGlobalEntity(
-        NULL, kSCDynamicStoreDomainState, kSCEntNetIPv4);
-    CFDictionaryRef global = SCDynamicStoreCopyValue(store, globalKey);
-    if (global) {
-        CFStringRef primary = CFDictionaryGetValue(global, kSCDynamicStorePropNetPrimaryInterface);
-        if (primary) result = [NSString stringWithString:(__bridge NSString *)primary];
-        CFRelease(global);
+    NSString *found = nil;
+
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        // 只用 IPv4 主地址（跳过 127.x）
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) continue;
+
+        const char *name = ifa->ifa_name;
+        if (TVIsIgnoredInterface(name)) continue;
+        if (strncmp(name, "en", 2) != 0) continue;   // 仅物理网卡
+        if (!TVInterfaceIsActive(name)) continue;
+
+        found = [NSString stringWithUTF8String:name];
+        break;
     }
-    if (globalKey) CFRelease(globalKey);
-    CFRelease(store);
-    return result;
-}
 
-// 综合判断：是否「以太网已连通」
-static BOOL TVIsEthernetConnected(void) {
-    // 1. 必须先有主接口
-    NSString *bsd = TVPrimaryInterfaceBSDName();
-    if (bsd.length == 0) return NO;
-
-    // 2. 该接口必须是以太网类型
-    if (!TVInterfaceIsEthernet(bsd)) return NO;
-
-    // 3. 用可达性再确认一次连通
-    SCNetworkReachabilityRef reach = SCNetworkReachabilityCreateWithName(
-        NULL, "1.1.1.1");
-    if (!reach) return NO;
-    SCNetworkReachabilityFlags flags = 0;
-    BOOL ok = SCNetworkReachabilityGetFlags(reach, &flags);
-    CFRelease(reach);
-    if (!ok) return NO;
-
-    BOOL reachable = (flags & kSCNetworkReachabilityFlagsReachable) != 0;
-    BOOL needsConn = (flags & kSCNetworkReachabilityFlagsConnectionRequired) != 0;
-    return reachable && !needsConn;
+    freeifaddrs(ifaddr);
+    return found;
 }
 
 // ==========================================================================
@@ -185,17 +168,20 @@ static BOOL TVLaunchTargetApp(void) {
 }
 
 // ==========================================================================
-//  网络可达性回调
+//  网络可达性回调（任何网络变化都会触发，再自行判断以太网状态）
 // ==========================================================================
+static BOOL gLastEthernetConnected = NO;
+
 static void TVReachabilityCallback(SCNetworkReachabilityRef target,
                                    SCNetworkReachabilityFlags flags,
                                    void *info) {
     (void)target; (void)info;
-    gLastReachabilityFlags = (int)flags;
 
-    BOOL connected = TVIsEthernetConnected();
-    TVLog(@"reachability changed: ethernetConnected=%d (was=%d) flags=0x%x",
-          connected, gLastEthernetConnected, flags);
+    NSString *ifName = TVConnectedEthernetInterface();
+    BOOL connected = (ifName != nil);
+
+    TVLog(@"reachability changed: ethernetConnected=%d (was=%d) iface=%@ flags=0x%x",
+          connected, gLastEthernetConnected, ifName ?: @"-", flags);
 
     if (connected && !gLastEthernetConnected) {
         TVLog(@"ethernet connected, triggering app launch");
@@ -220,9 +206,10 @@ int main(int argc, char *argv[]) {
         TVLog(@"EthernetLauncher started (pid=%d)", getpid());
         TVLog(@"target bundle id = %@", TVTargetBundleID);
 
-        // 初始状态
-        gLastEthernetConnected = TVIsEthernetConnected();
-        TVLog(@"initial state: ethernetConnected=%d", gLastEthernetConnected);
+        gLastEthernetConnected = (TVConnectedEthernetInterface() != nil);
+        TVLog(@"initial state: ethernetConnected=%d iface=%@",
+              gLastEthernetConnected,
+              TVConnectedEthernetInterface() ?: @"-");
 
 #if TVTriggerOnInitialConnect
         if (gLastEthernetConnected) {
@@ -231,7 +218,7 @@ int main(int argc, char *argv[]) {
         }
 #endif
 
-        // 建立可达性监控（对 0.0.0.0 建，任何网络变化都会回调）
+        // 对 0.0.0.0 建立可达性监控：任何网络变化都会回调
         struct sockaddr_in zeroAddr;
         memset(&zeroAddr, 0, sizeof(zeroAddr));
         zeroAddr.sin_len    = sizeof(zeroAddr);
@@ -257,10 +244,29 @@ int main(int argc, char *argv[]) {
 
         TVLog(@"reachability monitor started");
 
-        // 常驻
-        [[NSRunLoop currentRunLoop] run];
+        // 兜底轮询：可达性回调在部分场景不触发，每 5 秒自查一次
+        dispatch_source_t timer = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+        dispatch_source_set_timer(timer,
+            dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC),
+            5ull * NSEC_PER_SEC, 1ull * NSEC_PER_SEC);
+        dispatch_source_set_event_handler(timer, ^{
+            NSString *ifName = TVConnectedEthernetInterface();
+            BOOL connected = (ifName != nil);
+            if (connected != gLastEthernetConnected) {
+                TVLog(@"poll state change: ethernetConnected=%d (was=%d) iface=%@",
+                      connected, gLastEthernetConnected, ifName ?: @"-");
+                if (connected) {
+                    TVLog(@"ethernet connected (poll), triggering app launch");
+                    TVLaunchTargetApp();
+                }
+                gLastEthernetConnected = connected;
+            }
+        });
+        dispatch_resume(timer);
 
-        CFRelease(reach);
+        [[NSRunLoop currentRunLoop] run];
     }
     return 0;
 }
